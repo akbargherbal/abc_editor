@@ -17,6 +17,19 @@ Exit codes: 0 OK | 1 hard error (invalid ABC, header/bar-count change) | 2 budge
 Bar numbering: 1-based, per voice. `Z<n>` counts as n bars. Interleaved voice
 blocks are concatenated per voice. All-rest bars are compared as "R" in diffs
 (so `Z` vs `z8` is not a change). Chord symbols are ignored.
+
+Fixes (corpus validation pass, 177 transcriber scores):
+  * Inline bracketed fields are now parsed. `[K:...]` changes the key from that
+    point; `[M:...]` applies immediately when the bar is still empty, otherwise
+    it is deferred to the next bar with a warning; `[L:...]` applies immediately.
+    Previously their contents were tokenised as music (e.g. the `F` in
+    `[K:Fm]` became a phantom note that overflowed the bar).
+  * Bare body-level `K:` lines now change the key for the current voice instead
+    of being ignored with a warning.
+  * `MAJOR_SHARPS` now covers the theoretical sharp keys `G# D# A# E# B#` (and
+    `Fb`), with double-accidental support for signatures wider than 7. This
+    fixes `K:D#m` / `K:G#m` being read as "no key signature", which silently
+    transposed pitch names and histograms by a semitone.
 """
 import argparse
 import difflib
@@ -29,6 +42,7 @@ from fractions import Fraction as F
 
 TOKEN = re.compile(r"""
   (?P<bar>\|\]|\|\||\|:|:\||::|\|)
+ |(?P<inline>\[(?P<ifield>[A-Za-z]):(?P<ival>[^\]]*)\])
  |(?P<note>(?P<acc>[\^_=]{1,2})?(?P<letter>[A-Ga-g])(?P<oct>[',]*)(?P<len>\d*/?\d*)(?P<tie>-)?)
  |(?P<rest>[zx])(?P<rlen>\d*/?\d*)
  |(?P<mrest>Z)(?P<mcount>\d*)
@@ -39,7 +53,9 @@ TOKEN = re.compile(r"""
 BASE = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
 NAMES = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 MAJOR_SHARPS = {"C": 0, "G": 1, "D": 2, "A": 3, "E": 4, "B": 5, "F#": 6, "C#": 7,
-                "F": -1, "Bb": -2, "Eb": -3, "Ab": -4, "Db": -5, "Gb": -6, "Cb": -7}
+                "G#": 8, "D#": 9, "A#": 10, "E#": 11, "B#": 12,
+                "F": -1, "Bb": -2, "Eb": -3, "Ab": -4, "Db": -5, "Gb": -6, "Cb": -7,
+                "Fb": -8}
 MODE_OFFSET = {"": 0, "maj": 0, "lyd": 1, "mix": -1, "dor": -2, "m": -3, "min": -3, "phr": -4, "loc": -5}
 SHARP_ORDER = "FCGDAEB"
 FLAT_ORDER = "BEADGCF"
@@ -62,11 +78,16 @@ def key_signature(k):
     n = MAJOR_SHARPS[m.group(1)] + MODE_OFFSET[m.group(2) or ""]
     sig = {}
     if n > 0:
-        for L in SHARP_ORDER[:n]:
+        for L in SHARP_ORDER[:min(n, 7)]:
             sig[L] = 1
+        for L in SHARP_ORDER[:max(0, n - 7)]:
+            sig[L] = 2
     elif n < 0:
-        for L in FLAT_ORDER[:-n]:
+        flat = -n
+        for L in FLAT_ORDER[:min(flat, 7)]:
             sig[L] = -1
+        for L in FLAT_ORDER[:max(0, flat - 7)]:
+            sig[L] = -2
     return sig, True
 
 
@@ -90,6 +111,8 @@ class Voice:
         self.bars, self.cur = [], []
         self.acc = {}
         self.prev_tie = None
+        self.keysig = None
+        self.pending_meter = None
 
 
 class Score:
@@ -101,7 +124,50 @@ class Score:
         self.errors = []
         self.warnings = []
         self.keysig, self.key_ok = {}, True
+        self.key_changes = []
         self.tempo = (F(1, 4), 120)
+
+
+def keysig_text(sig):
+    return ", ".join(f"{k}{'#' * o if o > 0 else 'b' * -o}" for k, o in sig.items()) or "none"
+
+
+def set_key(sc, v, val, ln):
+    """Apply a key change to one voice (v) or to the score (v=None)."""
+    sig, ok = key_signature(val)
+    if not ok:
+        sc.warnings.append(f"line {ln}: K:{val} not recognised; pitch spelling may be off")
+        return
+    sc.key_changes.append((ln, val))
+    if v is None:
+        sc.keysig = sig
+    else:
+        v.keysig = dict(sig)
+
+
+def inline_field(sc, v, f, val, ln):
+    """Handle a bracketed `[X:...]` field at its exact position in the music."""
+    if f == "K":
+        set_key(sc, v, val, ln)
+    elif f == "M":
+        try:
+            mt = parse_meter(val)
+        except Exception:
+            sc.errors.append(f"line {ln}: bad inline M: {val}")
+            return
+        if v.cur:
+            v.pending_meter = mt
+            sc.warnings.append(f"line {ln}: mid-bar inline M:{val} deferred to next bar")
+        else:
+            v.meter = mt
+    elif f == "L":
+        try:
+            a, b = val.split("/")
+            v.unit = F(int(a), int(b))
+        except Exception:
+            sc.errors.append(f"line {ln}: bad inline L: {val}")
+    else:
+        sc.warnings.append(f"line {ln}: inline field {f}: ignored/unsupported")
 
 
 def parse(path):
@@ -150,9 +216,12 @@ def parse(path):
                     continue
                 if cur is None:
                     global_meter = mt
+                elif cur.cur:
+                    # Mid-bar meter changes are degenerate: let the open bar
+                    # finish under the old meter, then switch.
+                    cur.pending_meter = mt
+                    sc.warnings.append(f"line {ln}: mid-bar M:{val} deferred to next bar")
                 else:
-                    if cur.cur:
-                        close_bar(sc, cur, unterminated=True)
                     cur.meter = mt
             elif f == "L":
                 try:
@@ -163,7 +232,9 @@ def parse(path):
                         sc.header["L"] = val
                 except Exception:
                     sc.errors.append(f"line {ln}: bad L: {val}")
-            elif f in "WwKQP":
+            elif f == "K":
+                set_key(sc, cur, val, ln)
+            elif f in "WwQP":
                 sc.warnings.append(f"line {ln}: inline field {f}: ignored/unsupported")
             continue
         if cur is None:
@@ -173,7 +244,9 @@ def parse(path):
         text = re.sub(r"!\w+!", "", text)        # decorations
         for t in TOKEN.finditer(text):
             k = t.lastgroup
-            if t.group("bar"):
+            if t.group("inline"):
+                inline_field(sc, cur, t.group("ifield"), t.group("ival"), ln)
+            elif t.group("bar"):
                 close_bar(sc, cur)
             elif t.group("note"):
                 add_note(sc, cur, t)
@@ -200,7 +273,9 @@ def ensure_voice(sc, name, global_meter):
         except Exception:
             meter = F(4, 4)
         a, b = sc.header.get("L", "1/8").split("/")
-        sc.voices[name] = Voice(name, meter, F(int(a), int(b)))
+        v = Voice(name, meter, F(int(a), int(b)))
+        v.keysig = dict(sc.keysig)
+        sc.voices[name] = v
         sc.order.append(name)
     return sc.voices[name]
 
@@ -213,7 +288,8 @@ def add_note(sc, v, t):
         off = {"^": 1, "^^": 2, "_": -1, "__": -2, "=": 0}.get(acc, 0)
         v.acc[key] = off
     else:
-        off = v.acc.get(key, sc.keysig.get(letter.upper(), 0))
+        sig = v.keysig if v.keysig is not None else sc.keysig
+        off = v.acc.get(key, sig.get(letter.upper(), 0))
     midi = 12 * (octave + 1) + BASE[letter.upper()] + off
     v.cur.append({"k": "N", "dur": plen(t.group("len")) * v.unit, "text": t.group(0),
                   "midi": midi, "tie": bool(t.group("tie")), "explicit_acc": bool(acc)})
@@ -233,6 +309,9 @@ def close_bar(sc, v, unterminated=False):
     v.bars.append(make_bar(v, v.cur, unterminated))
     v.cur = []
     v.acc = {}
+    if v.pending_meter is not None:
+        v.meter = v.pending_meter
+        v.pending_meter = None
 
 
 # ------------------------------------------------------------------ analysis
@@ -307,8 +386,10 @@ def cmd_check(a):
     h = sc.header
     print(f"FILE: {a.file}")
     print(f"HEADER: M:{h.get('M')} L:{h.get('L')} Q:{h.get('Q')} K:{h.get('K')}"
-          f"  (key signature: {', '.join(f'{k}{"b" if o < 0 else "#"}' for k, o in sc.keysig.items()) or 'none'})")
+          f"  (key signature: {keysig_text(sc.keysig)})")
     print(f"VOICES: {', '.join(sc.order)}")
+    if sc.key_changes:
+        print("KEY CHANGES: " + ", ".join(f"line {ln}: {val}" for ln, val in sc.key_changes))
     durs = {}
     for n in sc.order:
         v = sc.voices[n]
