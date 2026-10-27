@@ -41,6 +41,11 @@ Changelog
   * `diff` now compares every `K:` / `M:` / `L:` field (inline and body-level)
     by position. Any added, removed or changed field is a hard error (exit 1):
     such edits re-pitch or re-time later notes without changing any bar text.
+  * `diff` compares every header field (not only M/L/Q/K).
+  * `diff` also proves that chord symbols and decorations (compared by bar
+    position), body-level `Q:`/`P:`/`W:`/`w:` lines and `% section` comment
+    lines are unchanged; any difference is a hard error. Chord symbols are
+    still ignored for bar lengths and bar-change counting.
   * A bare body-level `M:` line that arrives while a bar is open is a hard error
     again (an open bar means a lost barline in this dialect). An inline `[M:..]`
     in the middle of a bar is still only deferred with a warning.
@@ -55,7 +60,8 @@ from collections import Counter
 from fractions import Fraction as F
 
 TOKEN = re.compile(r"""
-  (?P<bar>\|\]|\|\||\|:|:\||::|\|)
+  (?P<mark>"[^"]*"|!\w+!)
+ |(?P<bar>\|\]|\|\||\|:|:\||::|\|)
  |(?P<inline>\[(?P<ifield>[A-Za-z]):(?P<ival>[^\]]*)\])
  |(?P<note>(?P<acc>[\^_=]{1,2})?(?P<letter>[A-Ga-g])(?P<oct>[',]*)(?P<len>\d*/?\d*)(?P<tie>-)?)
  |(?P<rest>[zx])(?P<rlen>\d*/?\d*)
@@ -144,7 +150,8 @@ class Voice:
         self.prev_tie = None
         self.keysig = None
         self.pending_meter = None
-        self.fields = []   # [(bar index being built, "K:Fm")] for every K/M/L field
+        self.fields = []   # [(bar index being built, "K:Fm")] for K/M/L/Q/P/W/w fields
+        self.marks = []    # [(bar index being built, '"Gm"')] chord symbols, decorations
 
 
 class Score:
@@ -284,16 +291,19 @@ def parse(path):
                 note_field(sc, cur, "K", val)
                 set_key(sc, cur, val, ln)
             elif f in "WwQP":
+                note_field(sc, cur, f, val)
                 sc.warnings.append(f"line {ln}: inline field {f}: ignored/unsupported")
             continue
         if cur is None:
             cur = ensure_voice(sc, "1", global_meter)
         text = re.sub(r"%.*$", "", line)
-        text = re.sub(r'"[^"]*"', "", text)      # chord symbols
-        text = re.sub(r"!\w+!", "", text)        # decorations
         for t in TOKEN.finditer(text):
             k = t.lastgroup
-            if t.group("inline"):
+            if t.group("mark"):
+                # chord symbol or decoration: no effect on notes, but remembered
+                # with its bar position so `diff` can prove it was not touched
+                cur.marks.append((len(cur.bars) + 1, t.group(0)))
+            elif t.group("inline"):
                 inline_field(sc, cur, t.group("ifield"), t.group("ival"), ln)
             elif t.group("bar"):
                 close_bar(sc, cur)
@@ -498,7 +508,16 @@ def load_lyrics(path):
     raw = open(path, encoding="utf-8").read()
     if path.lower().endswith(".json"):
         d = json.loads(raw)
-        raw = d["lyrics"] if isinstance(d, dict) and "lyrics" in d else raw
+        if isinstance(d, dict):
+            if "lyrics" not in d:
+                raise ValueError(f"{path}: JSON has no \"lyrics\" field (keys found: {sorted(d)}); "
+                                 f"save the lyrics to a .txt file and pass that")
+            d = d["lyrics"]
+        if isinstance(d, list):
+            d = "\n".join(str(x) for x in d)
+        if not isinstance(d, str):
+            raise ValueError(f"{path}: JSON lyrics must be a string or a list of lines")
+        raw = d
     out, cur = [], "(none)"
     for line in raw.splitlines():
         s = line.strip()
@@ -530,7 +549,11 @@ def cmd_fit(a):
         return 1
     gap = F(a.gap)
     ph = phrases(v, gap)
-    ly = load_lyrics(a.lyrics)
+    try:
+        ly = load_lyrics(a.lyrics)
+    except (ValueError, OSError) as e:
+        print("ERROR:", e)
+        return 1
     print(f"VOCAL PHRASES (split at rests >= {gap} whole note): {len(ph)}")
     for i, p in enumerate(ph, 1):
         print(f"  P{i:02d} bars {p['start']:>3}-{p['end']:<3} onsets={p['onsets']}")
@@ -554,17 +577,23 @@ def note_tokens(bars):
 def cmd_diff(a):
     old, new = parse(a.old), parse(a.new)
     hard = []
-    for f in "MLQK":
+    for f in sorted(set(old.header) | set(new.header)):
         if old.header.get(f) != new.header.get(f):
             hard.append(f"header {f}: {old.header.get(f)!r} -> {new.header.get(f)!r}")
     if old.order != new.order:
         hard.append(f"voice list changed: {old.order} -> {new.order}")
     if old.pre_fields != new.pre_fields:
-        hard.append(f"K/M/L fields before the first voice changed: {old.pre_fields} -> {new.pre_fields}")
+        hard.append(f"body fields before the first voice changed: {old.pre_fields} -> {new.pre_fields}")
     for n in old.order:
         if n in new.voices and old.voices[n].fields != new.voices[n].fields:
-            hard.append(f"{n}: K/M/L fields changed (bar, field): "
+            hard.append(f"{n}: body fields (K/M/L/Q/P/W/w) changed (bar, field): "
                         f"{old.voices[n].fields} -> {new.voices[n].fields}")
+    for n in old.order:
+        if n in new.voices and old.voices[n].marks != new.voices[n].marks:
+            hard.append(f"{n}: chord symbols / decorations changed (bar, text): "
+                        f"{old.voices[n].marks} -> {new.voices[n].marks}")
+    if old.sections != new.sections:
+        hard.append("section comment markers (% label lines) added, removed, renamed or moved")
     for p in validity(new):
         hard.append("new file: " + p)
     target_changed_bars, target_sounding = 0, 1

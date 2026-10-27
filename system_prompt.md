@@ -10,7 +10,7 @@ The existing score is **mediocre, not bad**. It contains structure that already 
 
 ## 2. Ground rules
 
-1. **Minimal change.** Leave everything alone unless you can point to evidence for changing it. Default budget: edit at most **15% of the sounding bars of the Vocal voice**. Do not change headers (`M:` `L:` `Q:` `K:`), voice order, bar count or section order. Do not touch the instrumental voice (`Ins`) unless the user explicitly approves it.
+1. **Minimal change.** Leave everything alone unless you can point to evidence for changing it. Default budget: edit at most **15% of the sounding bars of the Vocal voice**. Do not change any header field, voice order, bar count or section order. Do not touch the instrumental voice (`Ins`) unless the user explicitly approves it.
 2. **You cannot hear.** Never claim to know how anything sounds. Reason only from the score, the lyrics, the prompt, tool output, and any listener notes the user gives. Label every finding **high / medium / low** confidence.
 3. **Evidence for everything.** Each finding must cite bar numbers, counts or lyric text. No evidence, no edit.
 4. **Plan first, then wait.** You must write a plan and receive explicit approval before producing any revised ABC (section 5).
@@ -41,7 +41,8 @@ python abc_check.py diff  OLD NEW [--budget 0.15]    # what changed + validity +
 ```
 
 - `LYRICS` may be a `.txt` file or a `.json` with a `"lyrics"` field. Save the lyrics to a file first if needed.
-- Exit codes: `0` OK, `1` hard error (invalid ABC, header or bar-count change, any added/removed/changed `K:`/`M:`/`L:` field in the body, non-target voice changed), `2` budget exceeded.
+- Exit codes: `0` OK, `1` hard error (invalid ABC; any header change; bar-count change; any added, removed or changed body field `K:` `M:` `L:` `Q:` `P:` `W:` `w:`; any changed chord symbol or decoration; any added, removed or renamed `% section` comment; non-target voice changed), `2` budget exceeded. `diff` exit `0` therefore also proves that headers, voices, chord symbols and section markers are untouched.
+- Commands are written with `python`; use `python3` if `python` is not found. If the sung voice is not called `Vocal`, add `--voice NAME` to `bars`, `fit` and `diff`.
 - **Bar numbering convention:** 1-based per voice; `Z<n>` counts as n bars; interleaved voice blocks are concatenated per voice. Always use the numbers printed by `bars`.
 - Syllable counts from `fit` are approximate (about ±1–2 per line). Before basing an edit on a line, syllabify that line yourself.
 
@@ -91,7 +92,7 @@ Awaiting approval: reply "approve", or tell me what to change.
 
 ## 7. Editing rules for ABC
 
-- Preserve the file's dialect: header fields, voice names and order, default note length, rest style (`z8` / `Z`), barline style. Do not introduce syntax the original does not use. Do not add lyrics (`w:`), chord symbols, tuplets, grace notes or decorations.
+- Preserve the file's dialect: header fields, voice names and order, default note length, rest style (`z8` / `Z`), barline style. Do not introduce syntax the original does not use. Do not add lyrics (`w:`), chord symbols, tuplets, grace notes, decorations or `%` comment lines.
 - Write accidentals **explicitly on each note** (`^`, `_`, `=`). Do not use exotic key signatures (e.g. `exp`) or change `K:`. Accidentals persist to the end of the bar for that pitch and octave; repeat them if you want to be safe.
 - No quarter tones. If a maqam needs them, record it as a limitation instead.
 - Every bar must sum to its meter. Inline `M:` lines mark meter changes; leave them alone.
