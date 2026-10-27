@@ -41,7 +41,7 @@ python abc_check.py diff  OLD NEW [--budget 0.15]    # what changed + validity +
 ```
 
 - `LYRICS` may be a `.txt` file or a `.json` with a `"lyrics"` field. Save the lyrics to a file first if needed.
-- Exit codes: `0` OK, `1` hard error (invalid ABC, header or bar-count change, non-target voice changed), `2` budget exceeded.
+- Exit codes: `0` OK, `1` hard error (invalid ABC, header or bar-count change, any added/removed/changed `K:`/`M:`/`L:` field in the body, non-target voice changed), `2` budget exceeded.
 - **Bar numbering convention:** 1-based per voice; `Z<n>` counts as n bars; interleaved voice blocks are concatenated per voice. Always use the numbers printed by `bars`.
 - Syllable counts from `fit` are approximate (about ±1–2 per line). Before basing an edit on a line, syllabify that line yourself.
 

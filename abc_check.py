@@ -18,18 +18,32 @@ Bar numbering: 1-based, per voice. `Z<n>` counts as n bars. Interleaved voice
 blocks are concatenated per voice. All-rest bars are compared as "R" in diffs
 (so `Z` vs `z8` is not a change). Chord symbols are ignored.
 
-Fixes (corpus validation pass, 177 transcriber scores):
-  * Inline bracketed fields are now parsed. `[K:...]` changes the key from that
-    point; `[M:...]` applies immediately when the bar is still empty, otherwise
-    it is deferred to the next bar with a warning; `[L:...]` applies immediately.
-    Previously their contents were tokenised as music (e.g. the `F` in
-    `[K:Fm]` became a phantom note that overflowed the bar).
-  * Bare body-level `K:` lines now change the key for the current voice instead
-    of being ignored with a warning.
-  * `MAJOR_SHARPS` now covers the theoretical sharp keys `G# D# A# E# B#` (and
-    `Fb`), with double-accidental support for signatures wider than 7. This
-    fixes `K:D#m` / `K:G#m` being read as "no key signature", which silently
-    transposed pitch names and histograms by a semitone.
+Changelog
+  Corpus validation pass (177 transcriber scores):
+  * Inline bracketed fields `[K:..]`, `[M:..]`, `[L:..]` are parsed (before, their
+    contents were tokenised as music: the `F` in `[K:Fm]` became a phantom note
+    that overflowed the bar). `[K:..]` changes the key from that point; `[M:..]`
+    applies immediately when the bar is still empty, otherwise it is deferred to
+    the next bar with a warning; `[L:..]` applies immediately. Other inline
+    fields (`[Q:..]`, `[P:..]`, ...) are dropped with a warning. Inline `[V:..]`
+    is a hard error: notes after it would land in the wrong voice.
+  * Bare body-level `K:` lines change the key for the current voice (before:
+    ignored with a warning).
+  * `MAJOR_SHARPS` covers `G# D# A# E# B#` and `Fb`, with double accidentals for
+    signatures wider than 7. Before, `K:D#m` / `K:G#m` were read as "no key
+    signature" (with a "not recognised" warning, but still reported VALID),
+    which shifted pitch names and histograms by a semitone.
+  * `check` prints key signatures with accidentals and a `KEY CHANGES:` line.
+  Review pass:
+  * `K:` accepts long and capitalised mode names (`G Dorian`, `A Minor`),
+    `K:none` and an empty `K:` (ABC 2.1 3.1.14). An unknown mode word is a
+    warning ("not recognised"), never a silent fallback to major.
+  * `diff` now compares every `K:` / `M:` / `L:` field (inline and body-level)
+    by position. Any added, removed or changed field is a hard error (exit 1):
+    such edits re-pitch or re-time later notes without changing any bar text.
+  * A bare body-level `M:` line that arrives while a bar is open is a hard error
+    again (an open bar means a lost barline in this dialect). An inline `[M:..]`
+    in the middle of a bar is still only deferred with a warning.
 """
 import argparse
 import difflib
@@ -56,7 +70,6 @@ MAJOR_SHARPS = {"C": 0, "G": 1, "D": 2, "A": 3, "E": 4, "B": 5, "F#": 6, "C#": 7
                 "G#": 8, "D#": 9, "A#": 10, "E#": 11, "B#": 12,
                 "F": -1, "Bb": -2, "Eb": -3, "Ab": -4, "Db": -5, "Gb": -6, "Cb": -7,
                 "Fb": -8}
-MODE_OFFSET = {"": 0, "maj": 0, "lyd": 1, "mix": -1, "dor": -2, "m": -3, "min": -3, "phr": -4, "loc": -5}
 SHARP_ORDER = "FCGDAEB"
 FLAT_ORDER = "BEADGCF"
 
@@ -70,12 +83,30 @@ def plen(s):
     return F(int(a) if a else 1, int(b) if b else 2)
 
 
+MODE_WORDS = {
+    "": 0, "maj": 0, "major": 0, "ion": 0, "ionian": 0,
+    "m": -3, "min": -3, "minor": -3, "aeo": -3, "aeolian": -3,
+    "mix": -1, "mixolydian": -1, "dor": -2, "dorian": -2,
+    "phr": -4, "phrygian": -4, "lyd": 1, "lydian": 1, "loc": -5, "locrian": -5,
+}
+
+
 def key_signature(k):
-    """Return ({LETTER: offset}, recognised)."""
-    m = re.match(r"^\s*([A-G][#b]?)\s*(maj|min|mix|dor|lyd|phr|loc|m)?", k)
+    """Return ({LETTER: offset}, recognised).
+
+    Mode names are case-insensitive, long or short (ABC 2.1 3.1.14). `none` or an
+    empty value means no signature. Unknown mode words are NOT recognised
+    (caller warns); they never fall back to major."""
+    s = k.strip()
+    if s.lower() in ("", "none"):
+        return {}, True
+    m = re.match(r"^([A-G][#b]?)\s*([A-Za-z]*)", s)
     if not m or m.group(1) not in MAJOR_SHARPS:
         return {}, False
-    n = MAJOR_SHARPS[m.group(1)] + MODE_OFFSET[m.group(2) or ""]
+    word = m.group(2).lower()
+    if word not in MODE_WORDS:
+        return {}, False
+    n = MAJOR_SHARPS[m.group(1)] + MODE_WORDS[word]
     sig = {}
     if n > 0:
         for L in SHARP_ORDER[:min(n, 7)]:
@@ -113,6 +144,7 @@ class Voice:
         self.prev_tie = None
         self.keysig = None
         self.pending_meter = None
+        self.fields = []   # [(bar index being built, "K:Fm")] for every K/M/L field
 
 
 class Score:
@@ -125,6 +157,7 @@ class Score:
         self.warnings = []
         self.keysig, self.key_ok = {}, True
         self.key_changes = []
+        self.pre_fields = []   # K/M/L body fields seen before any voice exists
         self.tempo = (F(1, 4), 120)
 
 
@@ -145,9 +178,23 @@ def set_key(sc, v, val, ln):
         v.keysig = dict(sig)
 
 
+def note_field(sc, v, f, val):
+    """Remember a K/M/L field and where it sits, so `diff` can see it."""
+    text = f"{f}:{val.strip()}"
+    if v is None:
+        sc.pre_fields.append((0, text))
+    else:
+        v.fields.append((len(v.bars) + 1, text))
+
+
 def inline_field(sc, v, f, val, ln):
     """Handle a bracketed `[X:...]` field at its exact position in the music."""
-    if f == "K":
+    if f in "KML":
+        note_field(sc, v, f, val)
+    if f == "V":
+        sc.errors.append(f"line {ln}: inline [V:{val}] voice switch is not supported "
+                         f"(put V: on its own line); later notes would land in the wrong voice")
+    elif f == "K":
         set_key(sc, v, val, ln)
     elif f == "M":
         try:
@@ -214,14 +261,14 @@ def parse(path):
                 except Exception:
                     sc.errors.append(f"line {ln}: bad M: {val}")
                     continue
+                note_field(sc, cur, "M", val)
                 if cur is None:
                     global_meter = mt
-                elif cur.cur:
-                    # Mid-bar meter changes are degenerate: let the open bar
-                    # finish under the old meter, then switch.
-                    cur.pending_meter = mt
-                    sc.warnings.append(f"line {ln}: mid-bar M:{val} deferred to next bar")
                 else:
+                    # A bare M: line arriving while a bar is open means a lost
+                    # barline in this dialect: keep it a hard error.
+                    if cur.cur:
+                        close_bar(sc, cur, unterminated=True)
                     cur.meter = mt
             elif f == "L":
                 try:
@@ -230,9 +277,11 @@ def parse(path):
                         cur.unit = F(int(a), int(b))
                     else:
                         sc.header["L"] = val
+                    note_field(sc, cur, "L", val)
                 except Exception:
                     sc.errors.append(f"line {ln}: bad L: {val}")
             elif f == "K":
+                note_field(sc, cur, "K", val)
                 set_key(sc, cur, val, ln)
             elif f in "WwQP":
                 sc.warnings.append(f"line {ln}: inline field {f}: ignored/unsupported")
@@ -510,6 +559,12 @@ def cmd_diff(a):
             hard.append(f"header {f}: {old.header.get(f)!r} -> {new.header.get(f)!r}")
     if old.order != new.order:
         hard.append(f"voice list changed: {old.order} -> {new.order}")
+    if old.pre_fields != new.pre_fields:
+        hard.append(f"K/M/L fields before the first voice changed: {old.pre_fields} -> {new.pre_fields}")
+    for n in old.order:
+        if n in new.voices and old.voices[n].fields != new.voices[n].fields:
+            hard.append(f"{n}: K/M/L fields changed (bar, field): "
+                        f"{old.voices[n].fields} -> {new.voices[n].fields}")
     for p in validity(new):
         hard.append("new file: " + p)
     target_changed_bars, target_sounding = 0, 1
